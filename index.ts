@@ -1,13 +1,25 @@
+import dotenv from 'dotenv';
+dotenv.config();
 import express from 'express';
 import bodyParser from 'body-parser';
 import cors from 'cors';
+import OpenAI from 'openai';
+import { exec } from 'child_process';
+import { promisify } from 'util';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
+
+const execAsync = promisify(exec);
 
 const app = express();
-const port = 3000; // process.env.PORT ? Number(process.env.PORT) : 4000;
-
 app.use(cors());
-app.use(bodyParser.json({ limit: '5mb' }));
-app.use(bodyParser.urlencoded({ extended: true }));
+app.use(express.json());
+const port = 3000;
+
+type Threat = { threat: string; cwe: string; description: string };
+
+type VulnerabilityFinding = { cwe: string; message: string; line: number };
 
 interface SessionData {
   sessionId: string;
@@ -21,20 +33,66 @@ interface SessionData {
 
 const sessions: Record<string, SessionData> = {};
 
-function analyzeThreatSurface(context: Record<string, string>): { threat: string; cwe: string; description: string }[] {
-  const threats: { threat: string; cwe: string; description: string }[] = [];
-  const text = `${context.projectName || ''} ${context.description || ''} ${context.deployment || ''} ${context.compliance || ''}`.toLowerCase();
-  if (text.includes('upload') || text.includes('file')) {
-    threats.push({ threat: 'Path traversal / unsafe uploads', cwe: 'CWE-22 / CWE-434', description: 'User input in file paths and uploads can expose path traversal and unrestricted upload issues.' });
+const openai = process.env.OPENAI_API_KEY ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY }) : undefined;
+
+async function analyzeThreatSurface(context: Record<string, string>): Promise<Threat[]> {
+  if (!openai) {
+    return [
+      { threat: 'Input validation', cwe: 'CWE-20', description: 'Could not run LLM threat analysis due to missing OpenAI API key.' }
+    ];
   }
-  if (text.includes('sql') || text.includes('database') || text.includes('query')) {
-    threats.push({ threat: 'SQL injection', cwe: 'CWE-89', description: 'Unsanitized inputs in SQL queries can lead to SQL injection.' });
+
+  const prompt = `Given this project context, list the top 3 likely threat vectors and the best mitigation for each (include CWE IDs):\n` +
+    `Project name: ${context.projectName || 'N/A'}\n` +
+    `Description: ${context.description || 'N/A'}\n` +
+    `Language: ${context.language || 'N/A'}\n` +
+    `Deployment: ${context.deployment || 'N/A'}\n` +
+    `Compliance: ${context.compliance || 'N/A'}\n` +
+    `Return JSON array of objects: { threat, cwe, description }.`;
+
+  if (!openai) {
+    return [
+      { threat: 'Input validation', cwe: 'CWE-20', description: 'OpenAI API key is not configured.' }
+    ];
   }
-  if (text.includes('token') || text.includes('auth') || text.includes('session')) {
-    threats.push({ threat: 'Session management', cwe: 'CWE-384', description: 'Weak session handling may enable fixation or session theft.' });
+
+  const completion = await openai.chat.completions.create({
+    model: 'gpt-4.1-mini',
+    messages: [
+      { role: 'system', content: 'You are a secure software architect assistant.' },
+      { role: 'user', content: prompt }
+    ],
+    temperature: 0.2,
+    max_tokens: 320,
+  });
+
+  const text = completion.choices?.[0]?.message?.content?.trim();
+  if (!text) {
+    return [
+      { threat: 'Input validation', cwe: 'CWE-20', description: 'OpenAI returned no threat analysis.' }
+    ];
   }
-  if (text.includes('external') || text.includes('http') || text.includes('api')) {
-    threats.push({ threat: 'SSRF / hardcoded endpoints', cwe: 'CWE-918', description: 'Untrusted external request URLs can allow SSRF or injection.' });
+
+  try {
+    const parsed = JSON.parse(text.replace(/^[^\[]*/, '').replace(/[^\]]*$/, '')) as Threat[];
+    if (Array.isArray(parsed) && parsed.length > 0) {
+      return parsed;
+    }
+  } catch {
+    // ignore parse errors and fallback to heuristics
+  }
+
+  // Fallback simple heuristics
+  const textLower = `${context.projectName || ''} ${context.description || ''} ${context.deployment || ''} ${context.compliance || ''}`.toLowerCase();
+  const threats: Threat[] = [];
+  if (textLower.includes('upload') || textLower.includes('file')) {
+    threats.push({ threat: 'Path traversal / unsafe uploads', cwe: 'CWE-22 / CWE-434', description: 'User input in file paths and uploads can expose path traversal vulnerabilities.' });
+  }
+  if (textLower.includes('sql') || textLower.includes('database') || textLower.includes('query')) {
+    threats.push({ threat: 'SQL injection', cwe: 'CWE-89', description: 'Unsanitized SQL query usage may allow injection.' });
+  }
+  if (textLower.includes('token') || textLower.includes('auth') || textLower.includes('session')) {
+    threats.push({ threat: 'Session management', cwe: 'CWE-384', description: 'Weak session handling may lead to session hijacking.' });
   }
   if (threats.length === 0) {
     threats.push({ threat: 'Input validation', cwe: 'CWE-20', description: 'General input validation and sanitization should be enforced.' });
@@ -42,21 +100,66 @@ function analyzeThreatSurface(context: Record<string, string>): { threat: string
   return threats;
 }
 
-function analyzeCodeForVulns(code: string) {
-  const findings: Array<{ cwe: string; message: string; line: number }> = [];
+async function generateSecureCode(context: Record<string, string>, snippet: string, threats: string[]): Promise<string> {
+  if (!openai) {
+    return `// Unable to generate secure code because OpenAI API key is not configured.\n// Use the provided snippet as the base code and apply secure controls.`;
+  }
+
+  const prompt = `You are a secure software architect assistant. Given the project context and identified threats, generate secure TypeScript code implementing this service. Include inline security comments with CWE references and uncertainty flags where needed.\n\nContext: ${JSON.stringify(context)}\nThreats: ${JSON.stringify(threats)}\nUser snippet:\n${snippet}\n`;
+
+  const completion = await openai.chat.completions.create({
+    model: 'gpt-4.1-mini',
+    messages: [
+      { role: 'system', content: 'You are a secure code generation assistant.' },
+      { role: 'user', content: prompt }
+    ],
+    temperature: 0.2,
+    max_tokens: 700,
+  });
+
+  const text = completion.choices?.[0]?.message?.content?.trim();
+  return text || `// Could not generate secure code from LLM. Use the user snippet as code output.`;
+}
+
+async function analyzeCodeForVulns(code: string): Promise<VulnerabilityFinding[]> {
+  const findings: VulnerabilityFinding[] = [];
+
+  // Basic regex detector
   const lines = code.split(/\r?\n/);
-  lines.forEach((line, idx) => {
-    const trimmed = line.trim().toLowerCase();
+  for (let idx = 0; idx < lines.length; idx += 1) {
+    const trimmed = lines[idx].trim().toLowerCase();
     if (/eval\(|new Function\(|exec\(|spawn\(|system\(|popen\(/.test(trimmed)) {
-      findings.push({ cwe: 'CWE-95', message: 'Potential unsafe dynamic code execution', line: idx + 1 });
+      findings.push({ cwe: 'CWE-95', message: 'Potential dynamic code execution', line: idx + 1 });
     }
-    if (/\bselect\b.*\+|\+.*\bfrom\b|prepare\(|execute\(|database\.query\(/.test(trimmed)) {
-      findings.push({ cwe: 'CWE-89', message: 'Potential SQL injection pattern detected', line: idx + 1 });
+    if ((/\b(select|insert|update|delete)\b/.test(trimmed) && /\+/.test(trimmed)) || /prepare\(|execute\(|database\.query\(/.test(trimmed)) {
+      findings.push({ cwe: 'CWE-89', message: 'Potential SQL injection pattern (dynamic SQL/DB execution)', line: idx + 1 });
     }
     if (/fs\.(readFile|writeFile|readFileSync|writeFileSync)\(|path\.join\(|path\.resolve\(/.test(trimmed) && /\$\{.*\}|\+\s*req\.|req\./.test(trimmed)) {
       findings.push({ cwe: 'CWE-22', message: 'Potential path traversal with user-controlled data', line: idx + 1 });
     }
-  });
+  }
+
+  // Optional semgrep run
+  try {
+    const tmpFile = path.join(os.tmpdir(), `vibesecure-code-${Date.now()}.js`);
+    fs.writeFileSync(tmpFile, code, "utf8");
+    const semgrepCmd = `semgrep --config=c2 --json --output - ${tmpFile}`;
+    const { stdout } = await execAsync(semgrepCmd, { timeout: 120000 });
+    const json = JSON.parse(stdout);
+    if (Array.isArray(json.results)) {
+      json.results.forEach((r: any) => {
+        findings.push({
+          cwe: r.extra?.metadata?.cwe || 'CWE-0',
+          message: r.extra?.message || `${r.check_id}: ${r.extra?.short_description || 'Semgrep finding'}`,
+          line: r.start?.line || 0,
+        });
+      });
+    }
+    fs.unlinkSync(tmpFile);
+  } catch (err) {
+    // semgrep not available or failed; keep regex results
+  }
+
   return findings;
 }
 
@@ -64,8 +167,9 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', service: 'vibeserver', timestamp: new Date().toISOString() });
 });
 
-app.post('/webhook/vibesecure', (req, res) => {
+app.post('/webhook/vibesecure', async (req, res) => {
   const { eventType, payload } = req.body as { eventType?: string; payload?: any };
+  console.log('[webhook] eventType=', eventType, 'payload=', payload && (typeof payload === 'object' ? JSON.stringify(payload) : payload));
 
   if (!eventType || !payload) {
     return res.status(400).json({ error: 'eventType and payload are required' });
@@ -114,7 +218,7 @@ app.post('/webhook/vibesecure', (req, res) => {
       }
       let checks: any = undefined;
       if (stage === 'generation' && results && typeof results.code === 'string') {
-        checks = analyzeCodeForVulns(results.code);
+        checks = await analyzeCodeForVulns(results.code);
       }
       const stageRecord: Record<string, any> = {
         stage,
@@ -146,7 +250,9 @@ app.post('/webhook/vibesecure', (req, res) => {
       if (!context || typeof context !== 'object') {
         return res.status(400).json({ error: 'payload.context object required' });
       }
-      const analysis = analyzeThreatSurface(context);
+      console.log('[webhook] analyze:threat context:', context);
+      const analysis = await analyzeThreatSurface(context);
+      console.log('[webhook] analyze:threat result:', analysis);
       return res.json({ status: 'ok', analysis });
     }
 
@@ -155,8 +261,22 @@ app.post('/webhook/vibesecure', (req, res) => {
       if (!code || typeof code !== 'string') {
         return res.status(400).json({ error: 'payload.code string required' });
       }
-      const findings = analyzeCodeForVulns(code);
+      console.log('[webhook] analyze:code snippet length:', code.length);
+      const findings = await analyzeCodeForVulns(code);
+      console.log('[webhook] analyze:code findings:', findings);
       return res.json({ status: 'ok', findings });
+    }
+
+    case 'generate:secure-code': {
+      const { context, snippet, threats } = payload;
+      if (!context || typeof context !== 'object') {
+        return res.status(400).json({ error: 'payload.context object required' });
+      }
+      if (!snippet || typeof snippet !== 'string') {
+        return res.status(400).json({ error: 'payload.snippet string required' });
+      }
+      const code = await generateSecureCode(context, snippet, Array.isArray(threats) ? threats.map(String) : []);
+      return res.json({ status: 'ok', code });
     }
 
     default:
