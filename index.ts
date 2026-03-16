@@ -169,7 +169,7 @@ app.get('/health', (req, res) => {
 
 app.post('/webhook/vibesecure', async (req, res) => {
   const { eventType, payload } = req.body as { eventType?: string; payload?: any };
-  console.log('[webhook] eventType=', eventType, 'payload=', payload && (typeof payload === 'object' ? JSON.stringify(payload) : payload));
+  // console.log('[webhook] eventType=', eventType, 'payload=', payload && (typeof payload === 'object' ? JSON.stringify(payload) : payload));
 
   if (!eventType || !payload) {
     return res.status(400).json({ error: 'eventType and payload are required' });
@@ -250,9 +250,9 @@ app.post('/webhook/vibesecure', async (req, res) => {
       if (!context || typeof context !== 'object') {
         return res.status(400).json({ error: 'payload.context object required' });
       }
-      console.log('[webhook] analyze:threat context:', context);
+      // console.log('[webhook] analyze:threat context:', context);
       const analysis = await analyzeThreatSurface(context);
-      console.log('[webhook] analyze:threat result:', analysis);
+      // console.log('[webhook] analyze:threat result:', analysis);
       return res.json({ status: 'ok', analysis });
     }
 
@@ -261,9 +261,9 @@ app.post('/webhook/vibesecure', async (req, res) => {
       if (!code || typeof code !== 'string') {
         return res.status(400).json({ error: 'payload.code string required' });
       }
-      console.log('[webhook] analyze:code snippet length:', code.length);
+      // console.log('[webhook] analyze:code snippet length:', code.length);
       const findings = await analyzeCodeForVulns(code);
-      console.log('[webhook] analyze:code findings:', findings);
+      // console.log('[webhook] analyze:code findings:', findings);
       return res.json({ status: 'ok', findings });
     }
 
